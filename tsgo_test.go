@@ -508,20 +508,22 @@ func main() {
 	}
 }
 
-// TestIssue149_GoTestCachelinkFlag verifies that `go test` accepts the
-// -cachelink flag. The Tailscale fork adds it so distributed test
-// shards backed by a shared GOCACHEPROG don't re-link the test
-// binary for every -test.run invocation.
+// TestIssue149_CacheBinaryFlag verifies that the toolchain accepts
+// the -cachebinary build flag, which controls whether linker output
+// binaries are stored in the build cache. The Tailscale fork carries
+// it (patchset 4 of https://go-review.googlesource.com/c/go/+/739161,
+// pending upstream) so distributed test shards backed by a shared
+// GOCACHEPROG don't re-link the test binary for every -test.run
+// invocation. It replaced the fork's earlier `go test -cachelink`
+// flag in the Go 1.27 rebase.
 //
 // See https://github.com/tailscale/go/issues/149.
 //
-// The flag is registered with an empty usage string, so it does not
-// appear in `go help testflag`. We instead probe acceptance by
-// invoking `go test -cachelink` against a hermetic noop test
-// package in a temp dir and asserting that flag parsing succeeds.
-// A bogus flag is run as a control to confirm the probe harness
-// would actually catch a missing patch.
-func TestIssue149_GoTestCachelinkFlag(t *testing.T) {
+// We probe acceptance by invoking `go test -cachebinary` against a
+// hermetic noop test package in a temp dir and asserting that flag
+// parsing succeeds. A bogus flag is run as a control to confirm the
+// probe harness would actually catch a missing patch.
+func TestIssue149_CacheBinaryFlag(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(dir+"/go.mod", []byte("module probe\ngo 1.21\n"), 0644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
@@ -538,17 +540,17 @@ func TestIssue149_GoTestCachelinkFlag(t *testing.T) {
 	}
 
 	// Control: an obviously bogus flag must produce a flag-parse error.
-	if out, err := run("-cachelink-not-a-real-flag"); err == nil || !strings.Contains(out, "flag provided but not defined") {
+	if out, err := run("-cachebinary-not-a-real-flag"); err == nil || !strings.Contains(out, "flag provided but not defined") {
 		t.Fatalf("control probe failed: expected unknown-flag error for bogus flag, got err=%v out=%s", err, out)
 	}
 
 	// Real flag: must be accepted.
-	out, err := run("-cachelink")
+	out, err := run("-cachebinary")
 	if err != nil {
-		t.Fatalf("go test -cachelink: %v\n%s", err, out)
+		t.Fatalf("go test -cachebinary: %v\n%s", err, out)
 	}
 	if strings.Contains(out, "flag provided but not defined") {
-		t.Fatalf("go test rejected -cachelink; tsgo patch missing.\nOutput:\n%s", out)
+		t.Fatalf("go test rejected -cachebinary; tsgo patch missing.\nOutput:\n%s", out)
 	}
 }
 
