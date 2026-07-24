@@ -34,6 +34,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -276,6 +277,66 @@ func TestIssue58_NetSockTrace(t *testing.T) {
 	}
 }
 
+// TestIssue58_NetSockTraceTCP verifies the DidCreateTCPConn and
+// WillCloseTCPConn SockTrace hooks, which fire when a TCP socket is
+// created or closed with a tracing context. tailscale.com uses them
+// to read TCP stats (e.g. retransmit counters) from the raw conn.
+// These hooks were added in a follow-up to the original SockTrace
+// patch and had a merge conflict in the Go 1.27 rebase (upstream's
+// newFD signature changed in net/sock_posix.go), so they get their
+// own test.
+//
+// See https://github.com/tailscale/go/issues/58.
+func TestIssue58_NetSockTraceTCP(t *testing.T) {
+	var created, closed atomic.Int64
+	trace := &net.SockTrace{
+		DidCreateTCPConn: func(c syscall.RawConn) {
+			if c == nil {
+				t.Error("DidCreateTCPConn called with nil RawConn")
+			}
+			created.Add(1)
+		},
+		WillCloseTCPConn: func(c syscall.RawConn) {
+			if c == nil {
+				t.Error("WillCloseTCPConn called with nil RawConn")
+			}
+			closed.Add(1)
+		},
+	}
+	ctx := net.WithSockTrace(context.Background(), trace)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	var d net.Dialer
+	c, err := d.DialContext(ctx, "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	if got := created.Load(); got == 0 {
+		t.Error("DidCreateTCPConn hook was never invoked")
+	}
+	if got := closed.Load(); got != 0 {
+		t.Errorf("WillCloseTCPConn hook invoked %d times before Close", got)
+	}
+	c.Close()
+	if got := closed.Load(); got == 0 {
+		t.Error("WillCloseTCPConn hook was never invoked after Close")
+	}
+}
+
 // TestIssue55_NetEnforcers verifies the four program-global
 // enforcement hooks the Tailscale Go fork adds for control-plane
 // safety nets: net.SetDialEnforcer, net.SetResolveEnforcer,
@@ -344,6 +405,37 @@ func TestIssue55_NetEnforcers(t *testing.T) {
 	}
 	if got := issue55ResponseWriteCalls.Load(); got <= rwBefore {
 		t.Errorf("responseWriteEnforcer was not invoked by the test server; before=%d after=%d", rwBefore, got)
+	}
+}
+
+// TestIssue55_ResponseWriteEnforcerHTTP2 verifies that the response
+// write enforcer also fires on the HTTP/2 server path. This became a
+// distinct code path in the Go 1.27 rebase: upstream deleted
+// h2_bundle.go in favor of the net/http/internal/http2 package, so
+// the fork's hook moved from the bundle into that package
+// (http2.ResponseWriteEnforcer). A regression that wires up only the
+// HTTP/1 path would pass TestIssue55_NetEnforcers and be caught here.
+//
+// See https://github.com/tailscale/go/issues/55.
+func TestIssue55_ResponseWriteEnforcerHTTP2(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("pong"))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	rwBefore := issue55ResponseWriteCalls.Load()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("response was %s; want HTTP/2.0 (test server misconfigured)", resp.Proto)
+	}
+	if got := issue55ResponseWriteCalls.Load(); got <= rwBefore {
+		t.Errorf("responseWriteEnforcer was not invoked on the HTTP/2 path; before=%d after=%d", rwBefore, got)
 	}
 }
 
@@ -691,4 +783,3 @@ func TestIssue99_NoPidfdOnAndroid(t *testing.T) {
 		t.Skipf("control: GOOS=linux os.pidfdWorks has no calls either; compiler likely inlined or folded the body. Cannot distinguish patched behavior.\n%s", linuxBody)
 	}
 }
-
